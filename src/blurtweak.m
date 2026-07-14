@@ -177,6 +177,27 @@ static inline BOOL isAeroFinderEffectView(NSView *view) {
   return [objc_getAssociatedObject(view, &kAeroFinderEffectViewKey) boolValue];
 }
 
+// Finder owns the toolbar, path bar, and status bar backgrounds. Clearing
+// anything inside these hierarchies makes file content show through the bars.
+static inline BOOL isFinderChromeView(NSView *view) {
+  NSView *current = view;
+  while (current) {
+    NSString *className = NSStringFromClass([current class]);
+    if ([className containsString:@"Toolbar"] ||
+        [className containsString:@"Titlebar"] ||
+        [className containsString:@"StatusBar"] ||
+        [className containsString:@"NSBanner"] ||
+        [className containsString:@"SplitViewItemAccessory"] ||
+        [className containsString:@"PathControl"] ||
+        [className containsString:@"ListHeader"] ||
+        [className containsString:@"TableHeader"]) {
+      return YES;
+    }
+    current = current.superview;
+  }
+  return NO;
+}
+
 // Check if view belongs to QuickLook or WebKit
 static inline BOOL isQuickLookOrWebKitView(NSView *view) {
   if (!view)
@@ -209,6 +230,8 @@ static void processViewHierarchy(NSView *view) {
   if (view.window && !shouldModifyWindow(view.window))
     return;
   if (isAeroFinderEffectView(view))
+    return;
+  if (isFinderChromeView(view))
     return;
 
   NSString *className = NSStringFromClass([view class]);
@@ -303,6 +326,8 @@ static inline void pruneImmediateBackgroundViews(NSView *view) {
   for (NSView *subview in subviews) {
     if (isQuickLookOrWebKitView(subview))
       continue;
+    if (isFinderChromeView(subview))
+      continue;
     NSString *className = NSStringFromClass([subview class]);
     BOOL isBackgroundClass =
         ([className isEqualToString:@"NSTitlebarBackgroundView"] ||
@@ -340,6 +365,8 @@ static void refreshScrollStacksInView(NSView *view, NSInteger depth) {
   if (!view || depth > 3)
     return;
   if (isQuickLookOrWebKitView(view))
+    return;
+  if (isFinderChromeView(view))
     return;
   if ([view isKindOfClass:[NSScrollView class]]) {
     ensureTransparentScrollStack((NSScrollView *)view);
@@ -397,6 +424,8 @@ static inline void ensureTransparentScrollStack(NSScrollView *scrollView) {
   void (^applyTransparency)(NSView *) = ^(NSView *view) {
     if (!view || isQuickLookOrWebKitView(view))
       return;
+    if (isFinderChromeView(view))
+      return;
     if (!view.wantsLayer)
       view.wantsLayer = YES;
 
@@ -420,6 +449,8 @@ static inline void ensureTransparentScrollStack(NSScrollView *scrollView) {
 
   void (^hideBackgroundLayer)(NSView *) = ^(NSView *view) {
     if (!view || isQuickLookOrWebKitView(view))
+      return;
+    if (isFinderChromeView(view))
       return;
     NSString *className = NSStringFromClass([view class]);
 
