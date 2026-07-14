@@ -158,6 +158,7 @@ static inline BOOL shouldModifyWindow(NSWindow *window) {
   if ([windowClassName isEqualToString:@"TGoToWindowController"] ||
       [windowClassName containsString:@"TGoToWindow"] ||
       [windowClassName containsString:@"GoToWindow"] ||
+      [windowClassName containsString:@"Preferences"] ||
       [windowClassName containsString:@"QLPreview"] ||
       [windowClassName containsString:@"QuickLook"])
     return NO;
@@ -169,6 +170,7 @@ static inline BOOL shouldModifyWindow(NSWindow *window) {
     if ([controllerClassName isEqualToString:@"TGoToWindowController"] ||
         [controllerClassName containsString:@"TGoToWindow"] ||
         [controllerClassName containsString:@"GoToWindow"] ||
+        [controllerClassName containsString:@"Preferences"] ||
         [controllerClassName containsString:@"QLPreview"] ||
         [controllerClassName containsString:@"QuickLook"])
       return NO;
@@ -178,7 +180,8 @@ static inline BOOL shouldModifyWindow(NSWindow *window) {
   NSString *title = window.title;
   if (title.length > 0) {
     if ([title containsString:@"Go to"] || [title containsString:@"Go To"] ||
-        [title isEqualToString:@"Go to the Folder:"])
+        [title isEqualToString:@"Go to the Folder:"] ||
+        [title isEqualToString:@"Finder Settings"])
       return NO;
   }
 
@@ -233,6 +236,32 @@ static void setNativeChromeBackgroundHidden(NSView *view) {
   view.alphaValue = 0.0;
 }
 
+static CGFloat finderSidebarWidthInView(NSView *view, NSView *contentView,
+                                        NSInteger depth) {
+  if (!view || !contentView || depth > 14)
+    return 0.0;
+
+  NSString *className = NSStringFromClass([view class]);
+  if ([className containsString:@"TSidebarScrollView"] && !view.hidden &&
+      NSWidth(view.bounds) > 0.0) {
+    NSRect sidebarRect = [view convertRect:view.bounds toView:contentView];
+    return NSMaxX(sidebarRect);
+  }
+
+  for (NSView *subview in [view.subviews copy]) {
+    CGFloat width = finderSidebarWidthInView(subview, contentView, depth + 1);
+    if (width > 0.0)
+      return width;
+  }
+  return 0.0;
+}
+
+static CGFloat finderSidebarWidthForWindow(NSWindow *window) {
+  if (!window || !window.contentView)
+    return 0.0;
+  return finderSidebarWidthInView(window.contentView, window.contentView, 0);
+}
+
 static void ensureChromeEffectInHost(
     NSView *host, NSVisualEffectBlendingMode blendingMode, CGFloat alphaValue) {
   if (!host)
@@ -255,12 +284,21 @@ static void ensureChromeEffectInHost(
   effectView.state = NSVisualEffectStateActive;
   effectView.hidden = NO;
   effectView.alphaValue = alphaValue;
-  effectView.frame = host.bounds;
+
+  NSRect effectFrame = host.bounds;
+  NSString *hostClassName = NSStringFromClass([host class]);
+  if ([hostClassName containsString:@"Titlebar"]) {
+    CGFloat sidebarWidth = finderSidebarWidthForWindow(host.window);
+    if (sidebarWidth > 0.0 && sidebarWidth < NSWidth(effectFrame)) {
+      effectFrame.origin.x += sidebarWidth;
+      effectFrame.size.width -= sidebarWidth;
+    }
+  }
+  effectView.frame = effectFrame;
 
   if (effectView.superview != host) {
     [effectView removeFromSuperview];
     NSView *contentSubview = nil;
-    NSString *hostClassName = NSStringFromClass([host class]);
     for (NSView *subview in [host.subviews copy]) {
       NSString *subviewClassName = NSStringFromClass([subview class]);
       if (([hostClassName containsString:@"Titlebar"] &&
