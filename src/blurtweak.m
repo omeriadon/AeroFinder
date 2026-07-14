@@ -312,14 +312,14 @@ static void refreshChromeEffectsInView(NSView *view, NSInteger depth) {
         setNativeChromeBackgroundHidden(subview);
       }
     }
-    ensureChromeEffectInHost(view, NSVisualEffectBlendingModeWithinWindow,
-                             0.84);
+    ensureChromeEffectInHost(view, NSVisualEffectBlendingModeBehindWindow,
+                             1.0);
   } else if ([className containsString:@"ListHeaderRowView"]) {
     for (NSView *subview in [view.subviews copy]) {
       if ([NSStringFromClass([subview class]) containsString:@"NSBannerView"])
         hideBannerBackgroundViews(subview);
     }
-    ensureChromeEffectInHost(view, NSVisualEffectBlendingModeWithinWindow,
+    ensureChromeEffectInHost(view, NSVisualEffectBlendingModeBehindWindow,
                              1.0);
   } else if ([className containsString:@"StatusBar"] &&
              ![className containsString:@"StackView"]) {
