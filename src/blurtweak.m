@@ -155,6 +155,12 @@ static inline BOOL shouldModifyWindow(NSWindow *window) {
   // EXCLUDE: TGoToWindowController and related windows
   // Check class name first as it's faster than string containment on titles
   NSString *windowClassName = NSStringFromClass([window class]);
+  // Finder creates several ordinary titled windows before their titles and
+  // controllers are fully configured. Only browser windows are in scope;
+  // this prevents Settings from being touched during that construction race.
+  if (![windowClassName containsString:@"BrowserWindow"])
+    return NO;
+
   if ([windowClassName isEqualToString:@"TGoToWindowController"] ||
       [windowClassName containsString:@"TGoToWindow"] ||
       [windowClassName containsString:@"GoToWindow"] ||
@@ -293,6 +299,15 @@ static void ensureChromeEffectInHost(
       effectFrame.origin.x += sidebarWidth;
       effectFrame.size.width -= sidebarWidth;
     }
+
+    effectView.wantsLayer = YES;
+    effectView.layer.masksToBounds = NO;
+    effectView.layer.shadowColor = [NSColor blackColor].CGColor;
+    effectView.layer.shadowOpacity = 0.28;
+    effectView.layer.shadowOffset = NSMakeSize(0.0, -1.0);
+    effectView.layer.shadowRadius = 2.0;
+  } else if (effectView.layer) {
+    effectView.layer.shadowOpacity = 0.0;
   }
   effectView.frame = effectFrame;
 
