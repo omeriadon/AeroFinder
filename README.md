@@ -1,11 +1,12 @@
-# Finder Liquid Glass Tweak
+# Finder HUD Blur Tweak
 
 <img width="1389" height="657" alt="image" src="https://github.com/user-attachments/assets/ad5210bb-9819-48f8-9da7-a2e42d21eed1" />
 
 ## Notes
 
 - The tweak does not apply to other apps or system dialogs.
-- No blur or vibrancy is used—only Liquid Glass.
+- Finder navigation windows use an always-active `NSVisualEffectView` with the
+  HUD window material.
 - Requires SIP and Library Validation to be disabled and ammonia for injection.
 
 ## Install

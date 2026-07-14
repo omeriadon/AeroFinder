@@ -6,25 +6,25 @@
 #import <objc/runtime.h>
 
 /**
- * AeroFinder - Finder Glass Effect Tweak (Merged v2.2 - Grouped Swizzling)
+ * AeroFinder - Finder HUD Effect Tweak (Merged v2.2 - Grouped Swizzling)
  *
  * IMPLEMENTATION:
  * - Hides Finder's background by removing/hiding NSVisualEffectView
- * - Adds NSGlassEffectView with .clear style to navigation windows
+ * - Adds an always-active NSVisualEffectView with HUD material to navigation
+ *   windows
  * - Handles Sidebar and Titlebar artifacts
  * - Smart Fullscreen and Focus handling
  * - Uses ZKSwizzleInterfaceGroup for safe, process-isolated injection
  *
  * REQUIREMENTS:
- * - macOS 26.0+ for NSGlassEffectView
  * - Finder-only injection
  */
 
 #pragma mark - Configuration
 
 static BOOL tweakEnabled = YES;
-static BOOL glassAvailable = NO;
-static NSMutableDictionary *glassViews = nil;
+static NSMutableDictionary<NSNumber *, NSVisualEffectView *> *effectViews = nil;
+static char kAeroFinderEffectViewKey;
 // static NSMutableDictionary *windowTimers = nil; // Removed in favor of
 // CVDisplayLink
 static NSMutableDictionary<NSNumber *, NSNumber *>
@@ -60,29 +60,43 @@ static inline BOOL isFinderProcess(void) {
   return isFinder;
 }
 
-// Check NSGlassEffectView availability
-static inline BOOL checkGlassAvailability(void) {
-  static dispatch_once_t onceToken;
-  dispatch_once(&onceToken, ^{
-    glassAvailable = (NSClassFromString(@"NSGlassEffectView") != nil);
-    NSLog(@"[AeroFinder] NSGlassEffectView available: %@",
-          glassAvailable ? @"YES" : @"NO");
-  });
-  return glassAvailable;
-}
-
 // Forward declarations
 static inline void ensureTransparentScrollStack(NSScrollView *scrollView);
 static void refreshScrollStacksInView(NSView *view, NSInteger depth);
 static void refreshScrollStacksForWindow(NSWindow *window);
 static void stopDisplayLinkForWindow(NSWindow *window);
+static inline BOOL shouldModifyWindow(NSWindow *window);
 static CVReturn
 displayLinkCallback(CVDisplayLinkRef link, const CVTimeStamp *inNow,
                     const CVTimeStamp *inOutputTime, CVOptionFlags flagsIn,
                     CVOptionFlags *flagsOut, void *displayLinkContext);
-static void applyGlassEffect(NSWindow *window);
-static void removeGlassEffect(NSWindow *window);
+static void applyHUDEffect(NSWindow *window);
+static void removeHUDEffect(NSWindow *window);
 static void processTitlebarArea(NSWindow *window);
+
+@interface AeroFinderEffectView : NSVisualEffectView
+@property(nonatomic, weak) NSWindow *ownerWindow;
+@property(nonatomic) BOOL allowsReattachment;
+@end
+
+@implementation AeroFinderEffectView
+
+- (void)viewDidMoveToSuperview {
+  [super viewDidMoveToSuperview];
+
+  if (self.superview || !self.allowsReattachment)
+    return;
+
+  NSWindow *window = self.ownerWindow;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (!self.superview && self.allowsReattachment && window &&
+        shouldModifyWindow(window)) {
+      applyHUDEffect(window);
+    }
+  });
+}
+
+@end
 
 // Check if window is in fullscreen mode
 static inline BOOL isWindowFullscreen(NSWindow *window) {
@@ -159,19 +173,8 @@ static inline BOOL shouldModifyWindow(NSWindow *window) {
   return YES;
 }
 
-// Set glass style to clear using runtime invocation
-static void setGlassStyleClear(NSView *glassView) {
-  SEL styleSelector = NSSelectorFromString(@"setStyle:");
-  if ([glassView respondsToSelector:styleSelector]) {
-    NSInteger clearStyle = 0;
-    NSMethodSignature *sig =
-        [glassView methodSignatureForSelector:styleSelector];
-    NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:sig];
-    [invocation setSelector:styleSelector];
-    [invocation setTarget:glassView];
-    [invocation setArgument:&clearStyle atIndex:2];
-    [invocation invoke];
-  }
+static inline BOOL isAeroFinderEffectView(NSView *view) {
+  return [objc_getAssociatedObject(view, &kAeroFinderEffectViewKey) boolValue];
 }
 
 // Check if view belongs to QuickLook or WebKit
@@ -205,7 +208,7 @@ static void processViewHierarchy(NSView *view) {
     return;
   if (view.window && !shouldModifyWindow(view.window))
     return;
-  if ([view isKindOfClass:NSClassFromString(@"NSGlassEffectView")])
+  if (isAeroFinderEffectView(view))
     return;
 
   NSString *className = NSStringFromClass([view class]);
@@ -305,7 +308,8 @@ static inline void pruneImmediateBackgroundViews(NSView *view) {
         ([className isEqualToString:@"NSTitlebarBackgroundView"] ||
          [className isEqualToString:@"_NSScrollViewContentBackgroundView"] ||
          [className isEqualToString:@"BackdropView"]);
-    if ([subview isKindOfClass:[NSVisualEffectView class]] ||
+    if ((!isAeroFinderEffectView(subview) &&
+         [subview isKindOfClass:[NSVisualEffectView class]]) ||
         isBackgroundClass) {
       dispatch_async(dispatch_get_main_queue(), ^{
         [subview removeFromSuperview];
@@ -559,27 +563,43 @@ displayLinkCallback(CVDisplayLinkRef link, const CVTimeStamp *inNow,
         }
       }
 
-      NSView *glassView = glassViews[key];
-      if (glassView && glassView.superview) {
+      NSVisualEffectView *effectView = effectViews[key];
+      if (effectView) {
+        effectView.state = NSVisualEffectStateActive;
+        effectView.hidden = NO;
+        effectView.alphaValue = 1.0;
+
+        if (effectView.superview != strongWindow.contentView) {
+          [effectView removeFromSuperview];
+          if (strongWindow.contentView.subviews.count > 0) {
+            [strongWindow.contentView
+                addSubview:effectView
+                positioned:NSWindowBelow
+                relativeTo:strongWindow.contentView.subviews.firstObject];
+          } else {
+            [strongWindow.contentView addSubview:effectView];
+          }
+        }
+
         NSView *bottomView = strongWindow.contentView.subviews.firstObject;
-        if (bottomView != glassView &&
+        if (bottomView != effectView &&
             strongWindow.contentView.subviews.count > 1) {
-          [glassView removeFromSuperview];
+          [effectView removeFromSuperview];
           [strongWindow.contentView
-              addSubview:glassView
+              addSubview:effectView
               positioned:NSWindowBelow
               relativeTo:strongWindow.contentView.subviews.firstObject];
-          if (glassView.layer)
-            glassView.layer.zPosition = -1000.0;
+          if (effectView.layer)
+            effectView.layer.zPosition = -1000.0;
         }
 
         NSRect extendedFrame =
             NSInsetRect(strongWindow.contentView.bounds, -3, -3);
-        if (!NSEqualRects(glassView.frame, extendedFrame)) {
-          glassView.frame = extendedFrame;
-          if (glassView.layer) {
-            glassView.layer.cornerRadius = 12.0;
-            glassView.layer.masksToBounds = YES;
+        if (!NSEqualRects(effectView.frame, extendedFrame)) {
+          effectView.frame = extendedFrame;
+          if (effectView.layer) {
+            effectView.layer.cornerRadius = 12.0;
+            effectView.layer.masksToBounds = YES;
           }
         }
       }
@@ -648,8 +668,8 @@ static void startWindowMaintenance(NSWindow *window) {
   }
 }
 
-static void applyGlassEffect(NSWindow *window) {
-  if (!shouldModifyWindow(window) || !glassAvailable)
+static void applyHUDEffect(NSWindow *window) {
+  if (!shouldModifyWindow(window))
     return;
 
   setWindowTransparent(window);
@@ -660,57 +680,61 @@ static void applyGlassEffect(NSWindow *window) {
     return;
 
   NSNumber *key = @((uintptr_t)window);
-  NSView *glassView = glassViews[key];
+  NSVisualEffectView *effectView = effectViews[key];
 
-  if (!glassView) {
-    Class glassClass = NSClassFromString(@"NSGlassEffectView");
-    if (!glassClass)
-      return;
-
+  if (!effectView) {
     NSRect extendedFrame = NSInsetRect(contentView.bounds, -3, -3);
-    glassView = [[glassClass alloc] initWithFrame:extendedFrame];
-    setGlassStyleClear(glassView);
-    glassView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    glassView.wantsLayer = YES;
-    if (glassView.layer) {
-      glassView.layer.cornerRadius = 12.0;
-      glassView.layer.masksToBounds = YES;
+    AeroFinderEffectView *managedEffectView =
+        [[AeroFinderEffectView alloc] initWithFrame:extendedFrame];
+    managedEffectView.ownerWindow = window;
+    managedEffectView.allowsReattachment = YES;
+    effectView = managedEffectView;
+    effectView.material = NSVisualEffectMaterialHUDWindow;
+    effectView.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+    effectView.state = NSVisualEffectStateActive;
+    effectView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    effectView.wantsLayer = YES;
+    if (effectView.layer) {
+      effectView.layer.cornerRadius = 12.0;
+      effectView.layer.masksToBounds = YES;
     }
-    glassViews[key] = glassView;
-    NSLog(@"[AeroFinder] Created NSGlassEffectView (clear style)");
+    objc_setAssociatedObject(effectView, &kAeroFinderEffectViewKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    effectViews[key] = effectView;
+    NSLog(@"[AeroFinder] Created always-active HUD NSVisualEffectView");
   }
 
   processViewHierarchy(contentView);
 
-  if (!glassView.superview) {
+  if (!effectView.superview) {
     if (contentView.subviews.count > 0) {
-      [contentView addSubview:glassView
+      [contentView addSubview:effectView
                    positioned:NSWindowBelow
                    relativeTo:contentView.subviews.firstObject];
     } else {
-      [contentView addSubview:glassView];
+      [contentView addSubview:effectView];
     }
-    if (glassView.layer)
-      glassView.layer.zPosition = -1000.0;
+    if (effectView.layer)
+      effectView.layer.zPosition = -1000.0;
   } else {
     NSView *bottomView = contentView.subviews.firstObject;
-    if (bottomView != glassView && contentView.subviews.count > 1) {
-      [glassView removeFromSuperview];
-      [contentView addSubview:glassView
+    if (bottomView != effectView && contentView.subviews.count > 1) {
+      [effectView removeFromSuperview];
+      [contentView addSubview:effectView
                    positioned:NSWindowBelow
                    relativeTo:contentView.subviews.firstObject];
-      if (glassView.layer)
-        glassView.layer.zPosition = -1000.0;
+      if (effectView.layer)
+        effectView.layer.zPosition = -1000.0;
     }
   }
 
   NSRect extendedFrame = NSInsetRect(contentView.bounds, -3, -3);
-  if (!NSEqualRects(glassView.frame, extendedFrame)) {
+  if (!NSEqualRects(effectView.frame, extendedFrame)) {
     BEGIN_NO_ANIMATION
-    glassView.frame = extendedFrame;
-    if (glassView.layer) {
-      glassView.layer.cornerRadius = 12.0;
-      glassView.layer.masksToBounds = YES;
+    effectView.frame = extendedFrame;
+    if (effectView.layer) {
+      effectView.layer.cornerRadius = 12.0;
+      effectView.layer.masksToBounds = YES;
     }
     END_NO_ANIMATION
   }
@@ -718,7 +742,7 @@ static void applyGlassEffect(NSWindow *window) {
   startWindowMaintenance(window);
 }
 
-static void removeGlassEffect(NSWindow *window) {
+static void removeHUDEffect(NSWindow *window) {
   NSNumber *key = @((uintptr_t)window);
   // NSTimer *timer = windowTimers[key];
   // if (timer && timer.valid) {
@@ -729,12 +753,15 @@ static void removeGlassEffect(NSWindow *window) {
   stopDisplayLinkForWindow(window);
   [windowMaintenanceTimestamps removeObjectForKey:key];
 
-  if (!glassViews)
+  if (!effectViews)
     return;
-  NSView *glassView = glassViews[key];
-  if (glassView) {
-    [glassView removeFromSuperview];
-    [glassViews removeObjectForKey:key];
+  NSVisualEffectView *effectView = effectViews[key];
+  if (effectView) {
+    if ([effectView isKindOfClass:[AeroFinderEffectView class]]) {
+      ((AeroFinderEffectView *)effectView).allowsReattachment = NO;
+    }
+    [effectView removeFromSuperview];
+    [effectViews removeObjectForKey:key];
   }
 
   window.backgroundColor = [NSColor windowBackgroundColor];
@@ -744,9 +771,9 @@ static void removeGlassEffect(NSWindow *window) {
 static void updateAllWindows(void) {
   for (NSWindow *window in [NSApplication sharedApplication].windows) {
     if (tweakEnabled)
-      applyGlassEffect(window);
+      applyHUDEffect(window);
     else
-      removeGlassEffect(window);
+      removeHUDEffect(window);
   }
 }
 
@@ -759,7 +786,7 @@ ZKSwizzleInterfaceGroup(_AeroFinder_NSWindow, NSWindow, NSObject,
 - (void)close {
   NSWindow *window = (NSWindow *)self;
   if (shouldModifyWindow(window)) {
-    removeGlassEffect(window);
+    removeHUDEffect(window);
   }
   ZKOrig(void);
 }
@@ -776,7 +803,7 @@ ZKSwizzleInterfaceGroup(_AeroFinder_NSWindow, NSWindow, NSObject,
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
           if (window && window.contentView && shouldModifyWindow(window)) {
-            applyGlassEffect(window);
+            applyHUDEffect(window);
           }
         });
   }
@@ -786,7 +813,7 @@ ZKSwizzleInterfaceGroup(_AeroFinder_NSWindow, NSWindow, NSObject,
 - (void)orderFront:(id)sender {
   NSWindow *window = (NSWindow *)self;
   if (tweakEnabled && shouldModifyWindow(window)) {
-    applyGlassEffect(window);
+    applyHUDEffect(window);
   }
   ZKOrig(void, sender);
 }
@@ -794,7 +821,7 @@ ZKSwizzleInterfaceGroup(_AeroFinder_NSWindow, NSWindow, NSObject,
 - (void)makeKeyAndOrderFront:(id)sender {
   NSWindow *window = (NSWindow *)self;
   if (tweakEnabled && shouldModifyWindow(window)) {
-    applyGlassEffect(window);
+    applyHUDEffect(window);
   }
   ZKOrig(void, sender);
 }
@@ -802,7 +829,7 @@ ZKSwizzleInterfaceGroup(_AeroFinder_NSWindow, NSWindow, NSObject,
 - (void)becomeKeyWindow {
   NSWindow *window = (NSWindow *)self;
   if (tweakEnabled && shouldModifyWindow(window)) {
-    applyGlassEffect(window);
+    applyHUDEffect(window);
   }
   ZKOrig(void);
 }
@@ -816,7 +843,7 @@ ZKSwizzleInterfaceGroup(_AeroFinder_NSWindow, NSWindow, NSObject,
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
           if (window && window.contentView && shouldModifyWindow(window)) {
-            applyGlassEffect(window);
+            applyHUDEffect(window);
           }
         });
   }
@@ -835,14 +862,14 @@ ZKSwizzleInterfaceGroup(_AeroFinder_NSWindow, NSWindow, NSObject,
 
   if (tweakEnabled && shouldModifyWindow(window)) {
     NSNumber *key = @((uintptr_t)window);
-    NSView *glassView = glassViews[key];
-    if (glassView && glassView.superview && window.contentView) {
+    NSVisualEffectView *effectView = effectViews[key];
+    if (effectView && effectView.superview && window.contentView) {
       BEGIN_NO_ANIMATION
       NSRect extendedFrame = NSInsetRect(window.contentView.bounds, -3, -3);
-      glassView.frame = extendedFrame;
-      if (glassView.layer) {
-        glassView.layer.cornerRadius = 12.0;
-        glassView.layer.masksToBounds = YES;
+      effectView.frame = extendedFrame;
+      if (effectView.layer) {
+        effectView.layer.cornerRadius = 12.0;
+        effectView.layer.masksToBounds = YES;
       }
       setWindowTransparent(window);
       dispatch_async(dispatch_get_main_queue(), ^{
@@ -883,7 +910,7 @@ ZKSwizzleInterfaceGroup(_AeroFinder_NSWindow, NSWindow, NSObject,
   BOOL isFullscreen = isWindowFullscreen(window);
 
   if (!wasFullscreen && isFullscreen) {
-    removeGlassEffect(window);
+    removeHUDEffect(window);
     window.backgroundColor = [NSColor windowBackgroundColor];
     window.opaque = YES;
   } else if (wasFullscreen && !isFullscreen) {
@@ -896,7 +923,7 @@ ZKSwizzleInterfaceGroup(_AeroFinder_NSWindow, NSWindow, NSObject,
             if (!window || isWindowFullscreen(window) ||
                 !shouldModifyWindow(window))
               return;
-            applyGlassEffect(window);
+            applyHUDEffect(window);
           });
     });
   }
@@ -1021,31 +1048,31 @@ ZKSwizzleInterfaceGroup(_AeroFinder_NSScrollView, NSScrollView, NSObject,
     return;
 
   NSNumber *key = @((uintptr_t)view.window);
-  NSView *glassView = glassViews[key];
-  if (!glassView || !glassView.superview)
+  NSVisualEffectView *effectView = effectViews[key];
+  if (!effectView || !effectView.superview)
     return;
 
   NSRect extendedFrame = NSInsetRect(view.bounds, -3, -3);
-  BOOL needsFrameUpdate = !NSEqualRects(glassView.frame, extendedFrame);
+  BOOL needsFrameUpdate = !NSEqualRects(effectView.frame, extendedFrame);
   BOOL needsRepositioning =
-      (view.subviews.firstObject != glassView && view.subviews.count > 1);
+      (view.subviews.firstObject != effectView && view.subviews.count > 1);
 
   if (needsFrameUpdate || needsRepositioning) {
     BEGIN_NO_ANIMATION
     if (needsFrameUpdate) {
-      glassView.frame = extendedFrame;
-      if (glassView.layer) {
-        glassView.layer.cornerRadius = 12.0;
-        glassView.layer.masksToBounds = YES;
+      effectView.frame = extendedFrame;
+      if (effectView.layer) {
+        effectView.layer.cornerRadius = 12.0;
+        effectView.layer.masksToBounds = YES;
       }
     }
     if (needsRepositioning) {
-      [glassView removeFromSuperview];
-      [view addSubview:glassView
+      [effectView removeFromSuperview];
+      [view addSubview:effectView
             positioned:NSWindowBelow
             relativeTo:view.subviews.firstObject];
-      if (glassView.layer)
-        glassView.layer.zPosition = -1000.0;
+      if (effectView.layer)
+        effectView.layer.zPosition = -1000.0;
     }
     END_NO_ANIMATION
   }
@@ -1063,27 +1090,20 @@ __attribute__((constructor)) static void initAeroFinder(void) {
       return;
     }
 
-    // 2. CAPABILITY CHECK
-    if (!checkGlassAvailability()) {
-      NSLog(@"[AeroFinder] NSGlassEffectView not available (requires macOS "
-            @"26.0+)");
-      return;
-    }
-
-    // 3. INITIALIZATION
-    glassViews = [NSMutableDictionary dictionary];
+    // 2. INITIALIZATION
+    effectViews = [NSMutableDictionary dictionary];
     // windowTimers = [NSMutableDictionary dictionary]; // Removed
     windowMaintenanceTimestamps = [NSMutableDictionary dictionary];
     windowDisplayLinks = [NSMutableDictionary dictionary];
     windowScrollTimestamps = [NSMutableDictionary dictionary];
 
-    NSLog(@"[AeroFinder] Initializing glass effect tweak (Merged v2.2 Group)");
+    NSLog(@"[AeroFinder] Initializing HUD effect tweak (Merged v2.2 Group)");
 
-    // 4. ACTIVATE SWIZZLES
+    // 3. ACTIVATE SWIZZLES
     // Only activate now that we know we are safely inside Finder
     ZKSwizzleGroup(AeroFinderGroup);
 
-    // 5. UPDATE EXISTING WINDOWS
+    // 4. UPDATE EXISTING WINDOWS
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
