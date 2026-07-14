@@ -25,6 +25,8 @@
 static BOOL tweakEnabled = YES;
 static NSMutableDictionary<NSNumber *, NSVisualEffectView *> *effectViews = nil;
 static char kAeroFinderEffectViewKey;
+static char kAeroFinderChromeEffectViewKey;
+static char kAeroFinderNativeChromeStateKey;
 // static NSMutableDictionary *windowTimers = nil; // Removed in favor of
 // CVDisplayLink
 static NSMutableDictionary<NSNumber *, NSNumber *>
@@ -73,10 +75,23 @@ displayLinkCallback(CVDisplayLinkRef link, const CVTimeStamp *inNow,
 static void applyHUDEffect(NSWindow *window);
 static void removeHUDEffect(NSWindow *window);
 static void processTitlebarArea(NSWindow *window);
+static void refreshChromeEffectsForWindow(NSWindow *window);
+static void removeChromeEffectsForWindow(NSWindow *window);
 
 @interface AeroFinderEffectView : NSVisualEffectView
 @property(nonatomic, weak) NSWindow *ownerWindow;
 @property(nonatomic) BOOL allowsReattachment;
+@end
+
+@interface AeroFinderChromeEffectView : NSVisualEffectView
+@end
+
+@implementation AeroFinderChromeEffectView
+
+- (NSView *)hitTest:(NSPoint)point {
+  return nil;
+}
+
 @end
 
 @implementation AeroFinderEffectView
@@ -196,6 +211,185 @@ static inline BOOL isFinderChromeView(NSView *view) {
     current = current.superview;
   }
   return NO;
+}
+
+static void setNativeChromeBackgroundHidden(NSView *view) {
+  if (!view)
+    return;
+
+  if (!objc_getAssociatedObject(view, &kAeroFinderNativeChromeStateKey)) {
+    NSDictionary *state = @{
+      @"hidden" : @(view.hidden),
+      @"alpha" : @(view.alphaValue),
+    };
+    objc_setAssociatedObject(view, &kAeroFinderNativeChromeStateKey, state,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  }
+
+  // Finder reasserts these backgrounds during navigation and tab changes.
+  // Reapply our state every maintenance pass instead of treating the
+  // association as proof that the view is still hidden.
+  view.hidden = YES;
+  view.alphaValue = 0.0;
+}
+
+static void ensureChromeEffectInHost(
+    NSView *host, NSVisualEffectBlendingMode blendingMode, CGFloat alphaValue) {
+  if (!host)
+    return;
+
+  AeroFinderChromeEffectView *effectView =
+      objc_getAssociatedObject(host, &kAeroFinderChromeEffectViewKey);
+  if (!effectView) {
+    effectView = [[AeroFinderChromeEffectView alloc] initWithFrame:host.bounds];
+    effectView.material = NSVisualEffectMaterialHUDWindow;
+    effectView.state = NSVisualEffectStateActive;
+    effectView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    objc_setAssociatedObject(effectView, &kAeroFinderEffectViewKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(host, &kAeroFinderChromeEffectViewKey, effectView,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  }
+
+  effectView.blendingMode = blendingMode;
+  effectView.state = NSVisualEffectStateActive;
+  effectView.hidden = NO;
+  effectView.alphaValue = alphaValue;
+  effectView.frame = host.bounds;
+
+  if (effectView.superview != host) {
+    [effectView removeFromSuperview];
+    NSView *contentSubview = nil;
+    NSString *hostClassName = NSStringFromClass([host class]);
+    for (NSView *subview in [host.subviews copy]) {
+      NSString *subviewClassName = NSStringFromClass([subview class]);
+      if (([hostClassName containsString:@"Titlebar"] &&
+           [subviewClassName containsString:@"Toolbar"]) ||
+          ([hostClassName containsString:@"ListHeader"] &&
+           [subviewClassName containsString:@"ListHeaderCell"]) ||
+          ([hostClassName containsString:@"StatusBar"] &&
+           [subviewClassName containsString:@"StatusBarStack"]) ||
+          ([hostClassName containsString:@"NSBanner"] &&
+           [subviewClassName containsString:@"PathControl"])) {
+        contentSubview = subview;
+        break;
+      }
+    }
+
+    if (contentSubview) {
+      [host addSubview:effectView
+            positioned:NSWindowBelow
+            relativeTo:contentSubview];
+    } else if (host.subviews.count > 0) {
+      [host addSubview:effectView
+            positioned:NSWindowBelow
+            relativeTo:host.subviews.firstObject];
+    } else {
+      [host addSubview:effectView];
+    }
+  }
+}
+
+static void hideBannerBackgroundViews(NSView *bannerView) {
+  for (NSView *subview in [bannerView.subviews copy]) {
+    NSString *className = NSStringFromClass([subview class]);
+    if ([className containsString:@"NSBannerDecorationView"] ||
+        [className containsString:@"NSHardPocketView"]) {
+      setNativeChromeBackgroundHidden(subview);
+    }
+  }
+}
+
+static void refreshChromeEffectsInView(NSView *view, NSInteger depth) {
+  if (!view || depth > 14 || isAeroFinderEffectView(view))
+    return;
+
+  NSString *className = NSStringFromClass([view class]);
+  if ([className containsString:@"NSTitlebarView"]) {
+    for (NSView *subview in [view.subviews copy]) {
+      if ([NSStringFromClass([subview class])
+              containsString:@"RFVisualEffectView"]) {
+        setNativeChromeBackgroundHidden(subview);
+      }
+    }
+    ensureChromeEffectInHost(view, NSVisualEffectBlendingModeWithinWindow,
+                             0.84);
+  } else if ([className containsString:@"ListHeaderRowView"]) {
+    for (NSView *subview in [view.subviews copy]) {
+      if ([NSStringFromClass([subview class]) containsString:@"NSBannerView"])
+        hideBannerBackgroundViews(subview);
+    }
+    ensureChromeEffectInHost(view, NSVisualEffectBlendingModeWithinWindow,
+                             1.0);
+  } else if ([className containsString:@"StatusBar"] &&
+             ![className containsString:@"StackView"]) {
+    ensureChromeEffectInHost(view, NSVisualEffectBlendingModeBehindWindow,
+                             1.0);
+  } else if ([className containsString:@"NSBannerView"]) {
+    BOOL containsPathControl = NO;
+    for (NSView *subview in [view.subviews copy]) {
+      if ([NSStringFromClass([subview class]) containsString:@"PathControl"]) {
+        containsPathControl = YES;
+        break;
+      }
+    }
+    if (containsPathControl) {
+      hideBannerBackgroundViews(view);
+      ensureChromeEffectInHost(view, NSVisualEffectBlendingModeBehindWindow,
+                               1.0);
+    }
+  }
+
+  if ([view isKindOfClass:[NSClipView class]] ||
+      [className containsString:@"NSGlassEffectView"])
+    return;
+
+  for (NSView *subview in [view.subviews copy]) {
+    refreshChromeEffectsInView(subview, depth + 1);
+  }
+}
+
+static void refreshChromeEffectsForWindow(NSWindow *window) {
+  if (!window || !window.contentView || !window.contentView.superview)
+    return;
+  refreshChromeEffectsInView(window.contentView.superview, 0);
+}
+
+static void removeChromeEffectsInView(NSView *view, NSInteger depth) {
+  if (!view || depth > 14)
+    return;
+
+  NSVisualEffectView *effectView =
+      objc_getAssociatedObject(view, &kAeroFinderChromeEffectViewKey);
+  if (effectView) {
+    [effectView removeFromSuperview];
+    objc_setAssociatedObject(view, &kAeroFinderChromeEffectViewKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  }
+
+  NSDictionary *state =
+      objc_getAssociatedObject(view, &kAeroFinderNativeChromeStateKey);
+  if (state) {
+    view.hidden = [state[@"hidden"] boolValue];
+    view.alphaValue = [state[@"alpha"] doubleValue];
+    objc_setAssociatedObject(view, &kAeroFinderNativeChromeStateKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  }
+
+  NSString *className = NSStringFromClass([view class]);
+  if ([view isKindOfClass:[NSClipView class]] ||
+      [className containsString:@"NSGlassEffectView"])
+    return;
+
+  for (NSView *subview in [view.subviews copy]) {
+    removeChromeEffectsInView(subview, depth + 1);
+  }
+}
+
+static void removeChromeEffectsForWindow(NSWindow *window) {
+  if (!window || !window.contentView || !window.contentView.superview)
+    return;
+  removeChromeEffectsInView(window.contentView.superview, 0);
 }
 
 // Check if view belongs to QuickLook or WebKit
@@ -583,6 +777,7 @@ displayLinkCallback(CVDisplayLinkRef link, const CVTimeStamp *inNow,
       BEGIN_NO_ANIMATION
       setWindowTransparent(strongWindow);
       processTitlebarArea(strongWindow);
+      refreshChromeEffectsForWindow(strongWindow);
 
       if (isActive) {
         refreshScrollStacksForWindow(strongWindow);
@@ -705,6 +900,7 @@ static void applyHUDEffect(NSWindow *window) {
 
   setWindowTransparent(window);
   processTitlebarArea(window);
+  refreshChromeEffectsForWindow(window);
 
   NSView *contentView = window.contentView;
   if (!contentView)
@@ -783,6 +979,7 @@ static void removeHUDEffect(NSWindow *window) {
 
   stopDisplayLinkForWindow(window);
   [windowMaintenanceTimestamps removeObjectForKey:key];
+  removeChromeEffectsForWindow(window);
 
   if (!effectViews)
     return;
@@ -1052,6 +1249,10 @@ ZKSwizzleInterfaceGroup(_AeroFinder_NSScrollView, NSScrollView, NSObject,
     END_NO_ANIMATION
   }
   ZKOrig(void);
+  if (tweakEnabled && scrollView.window &&
+      shouldModifyWindow(scrollView.window)) {
+    refreshChromeEffectsForWindow(scrollView.window);
+  }
 }
 
 - (void)setNeedsDisplay:(BOOL)flag {
